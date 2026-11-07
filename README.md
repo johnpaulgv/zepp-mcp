@@ -45,11 +45,15 @@ real captured responses.
 > way it runs any local command.
 >
 > - **No hosted service.** There is nothing to sign up for and no backend I operate.
-> - **No cloud relay.** Your health data never passes through any server but Zepp's own.
+> - **No relay inside this process.** Tool results still go to the MCP client, which may send them to its model provider.
 > - **No open port.** stdio only — nothing listens on the network.
-> - **Your credentials stay in a local `.env`**, never in a client config file.
-> - **The only outbound connection** is HTTPS from your machine to Zepp's API,
->   read-only, exactly as the Zepp app does it.
+> - **For the restricted trial, keep the password in a mode-`0600` `.env`**
+>   next to this checkout. Do not copy it into the MCP client JSON.
+> - **The only outbound connection from this process** is HTTPS from your
+>   machine to a `*.zepp.com` host, with TLS verification on and redirects
+>   off. The MCP client still receives tool results and may send them to its
+>   model provider. This project does not add that hop, and it does not
+>   remove it.
 >
 > See [Architecture](#architecture) for the full picture.
 
@@ -57,6 +61,30 @@ real captured responses.
 > **Unofficial.** This project is not affiliated with, endorsed by, or
 > supported by Zepp Health or Huami. It talks to a private API that can change
 > or break without notice. See [Legal and safety](#legal-and-safety).
+
+## Restricted trial (default)
+
+Unset `ZEPP_MODE` is the candidate for one night and one workout on the
+machine that owns the account. The server enforces this; a client-side tool
+allowlist is not required.
+
+| What the process does | What it refuses |
+| --- | --- |
+| `zepp_auth_status`, `zepp_profile`, `zepp_sleep`, `zepp_list_workouts`, `zepp_workout_detail` | Every other tool, including `zepp_raw_request` |
+| `zepp_sleep(date=YYYY-MM-DD)` with no extra readiness, respiration or SpO₂ fetch | A sleep range, or sleep with no explicit date |
+| Workouts for one explicit `from_date` = `to_date` | The 90-day default, GPS, and raw streams |
+| Profile and device model / firmware | BLE pairing keys, MAC addresses, serial numbers, nicknames |
+| Token file mode `0600` in a `0700` directory, or no file | Symlinks, group/world-readable files, non-`zepp.com` hosts |
+| At most one login plus one refresh after HTTP 401 | Further password attempts in that process |
+
+`ZEPP_MODE=full` registers the previous tools again. Do not set it for the
+restricted trial. Trial mode also ignores `ZEPP_DEBUG`, `HTTPS_PROXY`,
+`HTTP_PROXY`, `ALL_PROXY` and `SSL_CERT_FILE`.
+
+This does not make the login official, does not prove a given watch model,
+and does not stop the MCP client from sending tool JSON to its model
+provider. Health responses are still not medical advice. A CA already inside
+the pinned `certifi` bundle is still trusted; environment CA overrides are not.
 
 ## Contents
 
@@ -189,9 +217,11 @@ Restart the Antigravity session afterwards — MCP servers are loaded at startup
 </details>
 
 > [!WARNING]
-> Zepp counts failed logins against a **shared 10-attempt lockout**. This
-> server never retries a failed login, and you shouldn't either. If
-> authentication fails, check your credentials carefully before trying again.
+> Zepp counts failed logins against a **shared 10-attempt lockout**. A failed
+> login stops further password attempts in that process. Do not restart the
+> server in a loop. The examples below that place `ZEPP_PASSWORD` in a client
+> JSON file are the full-mode shape; the restricted trial keeps the password
+> in `.env` only.
 
 ## Developer Setup
 
@@ -302,7 +332,7 @@ flowchart TB
     client <-->|"<b>stdio</b> · JSON-RPC over stdin/stdout<br/>no network · no open port"| tools
     env -.->|"read at startup"| auth
     auth -.->|"token only"| cache
-    http <-->|"<b>HTTPS · read-only</b><br/>the only outbound connection"| zepp
+    http <-->|"<b>HTTPS GET</b><br/>TLS verify · no redirects · *.zepp.com"| zepp
 
 ```
 
@@ -311,8 +341,9 @@ flowchart TB
 | Boundary | What crosses it |
 | --- | --- |
 | Client ↔ server | JSON-RPC over **stdio**. A pipe between two processes on your machine — not a socket, not a port. |
-| Server ↔ Zepp | **HTTPS, read-only.** Your credentials and your data go nowhere else. The server never writes to your Zepp account. |
-| Server ↔ disk | **The API token, and nothing else.** No workout, sleep or heart-rate data is ever persisted. |
+| Server ↔ Zepp | **HTTPS GET after login.** TLS verification stays on, redirects are not followed, and `HTTPS_PROXY` / `SSL_CERT_FILE` are ignored. The app token is sent only to an allowed `*.zepp.com` name. |
+| Server ↔ disk | **The API token, or nothing.** The file is mode `0600` in a `0700` directory. Health responses stay in memory. |
+| Client ↔ model provider | **Outside this repository.** Tool JSON reaches whatever service the MCP client uses. |
 
 **Lifecycle.** You never start the server. Your MCP client spawns it when it
 launches, speaks JSON-RPC over the pipe, and kills it on exit. Every session
@@ -320,6 +351,10 @@ gets a fresh process — which is exactly why the token is cached, so a restart
 does not mean a fresh login against Zepp's shared 10-attempt lockout.
 
 ## Tools
+
+In the default trial only five tools are registered, `zepp_sleep` does not
+join HRV or SpO₂, and workout history requires one explicit day. The table
+is the full-mode list.
 
 | Tool | Returns |
 | --- | --- |
@@ -335,7 +370,7 @@ does not mean a fresh login against Zepp's shared 10-attempt lockout.
 | `zepp_body_composition` | Smart-scale weight, BMI, and (real scale sync only) body fat/water/muscle %, bone mass, visceral fat, BMR |
 | `zepp_profile` | Height, weight, age, wear hand, paired devices. Never names, locations or device keys |
 | `zepp_describe_schema` | The metric catalogue: units, sources, verification level, known gaps |
-| `zepp_raw_request` | Arbitrary GET, for endpoints not modelled yet |
+| `zepp_raw_request` | Arbitrary GET. **Not registered unless `ZEPP_MODE=full`.** |
 | `zepp_auth_status` | Token expiry and region host |
 
 Every value says whether it was **measured** by the watch or **derived** by
@@ -347,13 +382,14 @@ is in [docs/capability-matrix.md](docs/capability-matrix.md).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZEPP_EMAIL`, `ZEPP_PASSWORD` | — | Credentials, from `.env` or the environment |
+| `ZEPP_EMAIL`, `ZEPP_PASSWORD` | — | Credentials, from a mode-`0600` `.env` or the process environment. Not from the MCP JSON in the trial. |
+| `ZEPP_MODE` | `trial` | `trial` (default) is the restricted tool list. `full` restores every tool, including raw GET. |
 | `ZEPP_TIMEZONE` | system zone | IANA zone for data that carries none (stress, PAI) |
 | `ZEPP_SPORT_CODES` | — | JSON (or a path to a JSON file) naming sport codes you have checked in the Zepp app, e.g. `{"17": "tennis"}` |
-| `ZEPP_TOKEN_CACHE` | `~/.zepp-mcp/token.json` | Path, or `off` |
+| `ZEPP_TOKEN_CACHE` | `~/.zepp-mcp/token.json` | Path, or `off`. The directory is created mode `0700` and the file mode `0600`. |
 | `ZEPP_RESPONSE_CACHE` | on | In-memory response cache; `off` disables it. Never written to disk |
 | `ZEPP_MIN_REQUEST_INTERVAL` | `0.35` | Seconds between outbound requests |
-| `ZEPP_DEBUG` | off | Re-enables httpx request logging (which includes your user id) |
+| `ZEPP_DEBUG` | off | In `ZEPP_MODE=full` only, re-enables httpx request lines (they include the user id, not the token). Ignored in trial mode. |
 
 ## Privacy
 
@@ -365,8 +401,9 @@ This is health data. The design reflects that.
   only, and never for long: anything covering the last week (or coming back
   empty) expires after five minutes, because a watch that syncs late fills
   in past days; older ranges expire after an hour.
-- **Only the API token is cached**, at `~/.zepp-mcp/token.json` (mode `0600`).
-  Set `ZEPP_TOKEN_CACHE=off` to disable and log in every time.
+- **Only the API token is cached**, at `~/.zepp-mcp/token.json` (file mode `0600`,
+  directory mode `0700`). A symlink or a group/world-readable file is deleted
+  instead of loaded. Set `ZEPP_TOKEN_CACHE=off` to disable and log in every time.
 - **Credentials live in `.env`**, never in client config files, never in
   source, never in logs.
 - **The fixture corpus is anonymised and CI-gated.** Captures come from a real

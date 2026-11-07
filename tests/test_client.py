@@ -23,7 +23,7 @@ def make_client(handler, cache: bool = True) -> api.ZeppClient:
     c._credential = Credential(
         app_token="tok",
         user_id=UID,
-        region_host="api-mifit.example",
+        region_host="api-mifit-us3.zepp.com",
         country_code="US",
         expires_at=time.time() + 86400 * 10,
     )
@@ -201,7 +201,7 @@ def test_401_reauthenticates_exactly_once_and_never_loops(monkeypatch):
 def test_401_then_success_after_one_login(monkeypatch):
     def fake_login(*args, **kwargs):
         return Credential(
-            "tok2", UID, "api-mifit.example", "US", time.time() + 86400 * 10
+            "tok2", UID, "api-mifit-us3.zepp.com", "US", time.time() + 86400 * 10
         )
 
     monkeypatch.setattr(api, "login", fake_login)

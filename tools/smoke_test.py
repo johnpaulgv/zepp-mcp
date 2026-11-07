@@ -33,21 +33,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TIMEOUT_SECONDS = 60
 
+# Default process is the restricted trial. ZEPP_MODE=full is not the candidate.
 EXPECTED_TOOLS = {
     "zepp_auth_status",
-    "zepp_body_composition",
-    "zepp_daily_summary",
-    "zepp_describe_schema",
-    "zepp_health_metrics",
-    "zepp_heart_rate",
     "zepp_list_workouts",
-    "zepp_period_summary",
     "zepp_profile",
-    "zepp_raw_request",
     "zepp_sleep",
-    "zepp_training_thresholds",
     "zepp_workout_detail",
-    "zepp_workout_stats",
 }
 
 

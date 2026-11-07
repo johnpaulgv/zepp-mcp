@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from .auth import Credential, LoginError, clear_cached, load_cached, login, save_cached
+from .safety import host_allowed, normalize_host, redact
 
 
 @dataclass
@@ -198,7 +199,12 @@ class ZeppClient:
         self._email = email
         self._password = password
         self._country = country
-        self._client = http or httpx.Client(timeout=30)
+        # verify stays on, redirects stay off, and the process environment
+        # cannot point this client at a proxy or a private CA. Callers that
+        # pass `http` (tests) bring their own transport.
+        self._client = http or httpx.Client(
+            timeout=30, verify=True, follow_redirects=False, trust_env=False,
+        )
         self._credential: Credential | None = None
         # Conservative pacing between outbound requests. Zepp's limits are
         # undocumented; one call per fetch page is the norm, and a multi-year
@@ -302,9 +308,19 @@ class ZeppClient:
         if slot > now:
             time.sleep(slot - now)
 
+    def _note(self, credential: Credential, text: str) -> str:
+        return redact(text, credential.app_token, self._email, self._password)
+
     def _request(self, credential: Credential, path: str,
                  params: dict[str, Any] | None) -> Outcome:
-        url = f"https://{credential.region_host}{path}"
+        host = normalize_host(credential.region_host)
+        if (not host_allowed(host) or not path.startswith("/")
+                or "://" in path or "\n" in path or "\r" in path):
+            return Outcome(
+                "error", 0, error_kind="unauthorized",
+                note="Refusing request: host or path is not allowed.",
+            )
+        url = f"https://{host}{path}"
         self._pace()
         self.requests_sent += 1
         try:
@@ -313,8 +329,10 @@ class ZeppClient:
                 params=params or {},
             )
         except httpx.HTTPError as exc:
-            return Outcome("error", 0, note=f"network error: {exc}",
-                           error_kind="network")
+            return Outcome(
+                "error", 0, error_kind="network",
+                note=self._note(credential, f"network error: {exc}"),
+            )
 
         # The user id appears in some paths; it is not echoed back to the
         # model, which may restate it in a transcript.
@@ -322,14 +340,15 @@ class ZeppClient:
         shown = path.replace(uid, "{uid}") if uid else path
         if response.status_code >= 400:
             kind, meaning = _classify(response.status_code)
-            # The body is echoed (truncated) because Zepp's error bodies carry
-            # the route and a code, never the token; the request line with the
-            # user id is NOT echoed.
+            # Truncated body only, with the token, password and user id removed.
+            body = response.text[:200].replace(uid or chr(0), "{uid}")
             return Outcome(
                 "error", response.status_code, error_kind=kind,
-                note=f"Zepp returned HTTP {response.status_code} for {shown}. "
-                     f"{meaning} Body starts: "
-                     f"{response.text[:200].replace(uid or chr(0), '{uid}')!r}",
+                note=self._note(
+                    credential,
+                    f"Zepp returned HTTP {response.status_code} for {shown}. "
+                    f"{meaning} Body starts: {body!r}",
+                ),
             )
 
         try:

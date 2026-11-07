@@ -113,7 +113,7 @@ def fake_zepp(monkeypatch):
         min_interval=0,
     )
     c._credential = Credential(
-        "tok", UID, "api-mifit.example", "US", time.time() + 864000
+        "tok", UID, "api-mifit-us3.zepp.com", "US", time.time() + 864000
     )
     monkeypatch.setattr(server, "_client", c)
     return c

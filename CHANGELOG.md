@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The default process is a restricted local trial: five tools, one explicit
+  calendar day, no raw GET, no GPS or raw streams, and sleep without the
+  extra readiness / respiration / SpO₂ join. `ZEPP_MODE=full` restores the
+  previous tool list and is not the trial candidate.
+- Login stops after a failure, and after two attempts in the process, so a
+  401 loop cannot walk Zepp's 10-attempt lockout.
+- Region hosts and cached tokens must be plain `*.zepp.com` DNS names. The
+  token file is written atomically, mode `0600`, in a `0700` directory, and
+  a symlink or a loose file is discarded instead of used.
+- The HTTP client keeps TLS verification, does not follow redirects, and
+  does not honor `HTTPS_PROXY` or `SSL_CERT_FILE`. `certifi` is pinned at or
+  above 2026.10.18.
+
 ### Added
 
 - Four tools. `zepp_health_metrics` covers readiness, HRV, resting heart

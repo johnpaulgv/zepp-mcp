@@ -18,14 +18,19 @@ from . import analysis, body, decode, events, metrics, sports, workouts
 from . import client as api
 from .auth import describe_expiry
 from .codes import format_pace
+from .safety import TRIAL_TOOLS, drop_location_fields, trial_enabled
 
 _ROOT = Path(__file__).resolve().parent.parent
 api.load_dotenv(_ROOT / ".env")
 
-# httpx logs every request line at INFO, including the full query string with
-# the user id in it. Quiet by default; ZEPP_DEBUG=1 brings it back.
-if os.environ.get("ZEPP_DEBUG", "").lower() not in ("1", "true", "yes"):
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+def _quiet_http_logs() -> None:
+    """Trial mode never emits httpx request lines. Full mode still needs ZEPP_DEBUG."""
+    debug = os.environ.get("ZEPP_DEBUG", "").lower() in {"1", "true", "yes"}
+    if trial_enabled() or not debug:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+_quiet_http_logs()
 
 server = MCPServer(
     name="zepp",
@@ -351,6 +356,13 @@ def zepp_sleep(
     across the recorded nights. enrich=False skips the readiness /
     respiratory-rate / SpO2 joins (three extra requests)."""
     try:
+        if trial_enabled():
+            enrich = False
+            if not date or from_date or to_date:
+                raise _BadInput(
+                    "Trial mode requires date=YYYY-MM-DD for the morning the "
+                    "sleep ended, and does not take a date range."
+                )
         if from_date or to_date:
             start, end = _range(from_date, to_date)
         else:
@@ -458,7 +470,16 @@ def zepp_list_workouts(
     list and "contested" codes stay unknown_sport_<code> with candidates.
     Say which when it matters."""
     try:
+        if trial_enabled():
+            if not from_date or not to_date:
+                raise _BadInput(
+                    "Trial mode requires explicit from_date and to_date as "
+                    "the same YYYY-MM-DD."
+                )
+            limit = min(int(limit), 10)
         start, end = _range(from_date, to_date, days=90)
+        if trial_enabled() and start != end:
+            raise _BadInput("Trial mode allows only one calendar day.")
         items, collected = _workouts(_get_client(), start, end, sport)
     except _BadInput as exc:
         return {"status": "error", "error": str(exc)}
@@ -502,6 +523,12 @@ def zepp_workout_detail(
     `include` selects which sections to decode; default is summary, laps and
     splits, because the stream and GPS sections can be very large."""
     try:
+        if trial_enabled():
+            if include and ({"gps", "streams"} & set(include)):
+                raise _BadInput(
+                    "Trial mode does not return GPS or raw streams."
+                )
+            include = ["summary", "laps", "splits"]
         outcome = api.workout_detail(_get_client(), track_id, source)
     except Exception as exc:
         return _fail(exc)
@@ -516,6 +543,8 @@ def zepp_workout_detail(
 
     result: dict[str, Any] = {"status": "ok", "track_id": track_id}
     result.update(decode.decode_detail(data, sections, _user_tz()))
+    if trial_enabled():
+        drop_location_fields(result)
     return result
 
 
@@ -1253,6 +1282,11 @@ def zepp_raw_request(
 ) -> dict[str, Any]:
     """Args: path such as /v1/data/band_data.json, plus query params. The
     user id and auth header are supplied automatically."""
+    if trial_enabled():
+        return {
+            "status": "error",
+            "error": "zepp_raw_request is not available in trial mode.",
+        }
     if not path.startswith("/"):
         return {"status": "error", "error": "path must start with '/'"}
     try:
@@ -1277,8 +1311,22 @@ def zepp_auth_status() -> dict[str, Any]:
     }
 
 
+def apply_trial_surface() -> None:
+    """Drop every tool the restricted trial does not enforce."""
+    if not trial_enabled():
+        return
+    for tool in list(server._tool_manager.list_tools()):
+        if tool.name not in TRIAL_TOOLS:
+            server._tool_manager.remove_tool(tool.name)
+
+
 def main() -> None:
+    _quiet_http_logs()
+    apply_trial_surface()
     server.run("stdio")
+
+
+apply_trial_surface()
 
 
 if __name__ == "__main__":
