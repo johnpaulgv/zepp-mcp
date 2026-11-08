@@ -16,16 +16,32 @@ from mcp.server import MCPServer
 
 from . import analysis, body, decode, events, metrics, sports, workouts
 from . import client as api
-from .auth import describe_expiry
+from .auth import LoginError, describe_expiry
 from .codes import format_pace
+from .safety import (
+    TRIAL_TIMEZONE,
+    TRIAL_TOOLS,
+    drop_location_fields,
+    on_trial_day,
+    select_trial_day,
+    service_error_note,
+    sleep_instants,
+    track_epoch,
+    trial_enabled,
+    trial_timezone,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 api.load_dotenv(_ROOT / ".env")
 
-# httpx logs every request line at INFO, including the full query string with
-# the user id in it. Quiet by default; ZEPP_DEBUG=1 brings it back.
-if os.environ.get("ZEPP_DEBUG", "").lower() not in ("1", "true", "yes"):
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+def _quiet_http_logs() -> None:
+    """Trial mode never emits httpx request lines. Full mode still needs ZEPP_DEBUG."""
+    debug = os.environ.get("ZEPP_DEBUG", "").lower() in {"1", "true", "yes"}
+    if trial_enabled() or not debug:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+_quiet_http_logs()
 
 server = MCPServer(
     name="zepp",
@@ -65,7 +81,18 @@ def _get_client() -> api.ZeppClient:
 
 
 def _fail(exc: Exception) -> dict[str, Any]:
-    return {"status": "error", "error": str(exc)}
+    """A failed call. Upstream exception text is never copied out."""
+    if isinstance(exc, _BadInput):
+        return {"status": "error", "error_code": "bad_input", "error": str(exc)}
+    if isinstance(exc, LoginError):
+        return {
+            "status": "error", "error_code": "login_failed",
+            "error": service_error_note(401, "unauthorized"),
+        }
+    return {
+        "status": "error", "error_code": "request_failed",
+        "error": "The request could not be completed.",
+    }
 
 
 class _BadInput(ValueError):
@@ -270,6 +297,27 @@ def zepp_heart_rate(
     return result
 
 
+def _select_trial_night(rows: list[dict[str, Any]], day: str) -> dict[str, Any] | None:
+    """The night whose wake falls on `day` in America/Bogota.
+
+    Several matches: latest wake, then earliest onset, then upstream order.
+    A row with no usable wake instant is not assigned to the morning.
+    """
+    ranked: list[tuple[int, int, int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        night = _night(row)
+        if night is None or night.get("status") != "ok":
+            continue
+        onset, wake = sleep_instants(row)
+        if wake is None or not on_trial_day(wake, day):
+            continue
+        ranked.append((-(wake), onset if onset is not None else 2**62, index, night))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[0][3]
+
+
 def _night(row: dict[str, Any]) -> dict[str, Any] | None:
     summary = decode.summarise_day(row)
     sleep = summary.get("sleep")
@@ -351,6 +399,13 @@ def zepp_sleep(
     across the recorded nights. enrich=False skips the readiness /
     respiratory-rate / SpO2 joins (three extra requests)."""
     try:
+        if trial_enabled():
+            enrich = False
+            if not date or from_date or to_date:
+                raise _BadInput(
+                    "Trial mode requires date=YYYY-MM-DD for the morning the "
+                    "sleep ended, and does not take a date range."
+                )
         if from_date or to_date:
             start, end = _range(from_date, to_date)
         else:
@@ -371,6 +426,15 @@ def zepp_sleep(
 
     single = not (from_date or to_date)
     if single:
+        if trial_enabled():
+            chosen = _select_trial_night(collected.items, start)
+            if chosen is None:
+                return {
+                    "status": "no_data", "date": start,
+                    "note": "No recorded sleep ends on this America/Bogota "
+                            "morning. A missing night is not zero hours.",
+                }
+            return chosen
         if not nights:
             return {"status": "no_data", "date": start,
                     "note": "No sleep block in this date's record."}
@@ -458,7 +522,16 @@ def zepp_list_workouts(
     list and "contested" codes stay unknown_sport_<code> with candidates.
     Say which when it matters."""
     try:
+        if trial_enabled():
+            if not from_date or not to_date:
+                raise _BadInput(
+                    "Trial mode requires explicit from_date and to_date as "
+                    "the same YYYY-MM-DD."
+                )
+            limit = min(int(limit), 10)
         start, end = _range(from_date, to_date, days=90)
+        if trial_enabled() and start != end:
+            raise _BadInput("Trial mode allows only one calendar day.")
         items, collected = _workouts(_get_client(), start, end, sport)
     except _BadInput as exc:
         return {"status": "error", "error": str(exc)}
@@ -468,6 +541,12 @@ def zepp_list_workouts(
     if collected.status == "error":
         return _collected_status(collected)
 
+    omitted_outside = omitted_invalid = 0
+    if trial_enabled():
+        # The history route is asked for this day, then ignored: a wide
+        # payload must not become total, sports_seen, or the page.
+        items, omitted_outside, omitted_invalid = select_trial_day(items, start)
+
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
     page = items[offset:offset + limit]
@@ -476,9 +555,31 @@ def zepp_list_workouts(
         "range": {"from": start, "to": end},
         "total": len(items), "offset": offset, "returned": len(page),
         "workouts": page,
-        "sports_present": sorted({i["sport"] for i in items}),
+        "sports_present": sorted({i.get("sport") for i in items if i.get("sport")}),
         "sports_seen": _sports_seen(items),
     }
+    if trial_enabled():
+        local_start = dt.datetime.combine(
+            dt.date.fromisoformat(start), dt.time.min, trial_timezone())
+        result["timezone"] = TRIAL_TIMEZONE
+        result["trial_day"] = {
+            "timezone": TRIAL_TIMEZONE,
+            "date": start,
+            "start_inclusive": local_start.isoformat(timespec="seconds"),
+            "end_exclusive": (local_start + dt.timedelta(days=1)).isoformat(
+                timespec="seconds"),
+        }
+        coverage = result.setdefault("coverage", {})
+        coverage["items"] = len(items)
+        coverage["omitted_outside_day"] = omitted_outside
+        coverage["omitted_invalid_timestamp"] = omitted_invalid
+        if not items:
+            result["status"] = "no_data"
+            result["note"] = (
+                "No workout starts on this America/Bogota date. Rows from "
+                "other days, and rows without a usable start timestamp, "
+                "are omitted from total, workouts and sports_seen."
+            )
     if offset + limit < len(items):
         result["next_offset"] = offset + limit
     if collected.status == "ok" and not items and sport:
@@ -497,12 +598,35 @@ def zepp_workout_detail(
     track_id: str,
     source: str,
     include: list[Literal["summary", "laps", "splits", "streams", "gps"]] | None = None,
+    date: str | None = None,
 ) -> dict[str, Any]:
     """Args: track_id and source, both from a zepp_list_workouts result.
     `include` selects which sections to decode; default is summary, laps and
-    splits, because the stream and GPS sections can be very large."""
+    splits, because the stream and GPS sections can be very large. Trial mode
+    also requires `date`, and refuses a track id outside that Bogota day
+    before calling the API."""
     try:
+        if trial_enabled():
+            if include and ({"gps", "streams"} & set(include)):
+                raise _BadInput(
+                    "Trial mode does not return GPS or raw streams."
+                )
+            if not date:
+                raise _BadInput(
+                    "Trial mode requires date=YYYY-MM-DD, the same "
+                    "America/Bogota day passed to zepp_list_workouts."
+                )
+            day, _same = _range(date, date)
+            epoch = track_epoch(track_id)
+            if epoch is None or not on_trial_day(epoch, day):
+                raise _BadInput(
+                    "Trial mode does not open a workout whose start is "
+                    "outside that America/Bogota date."
+                )
+            include = ["summary", "laps", "splits"]
         outcome = api.workout_detail(_get_client(), track_id, source)
+    except _BadInput as exc:
+        return {"status": "error", "error": str(exc)}
     except Exception as exc:
         return _fail(exc)
 
@@ -513,9 +637,20 @@ def zepp_workout_detail(
     data = outcome.data.get("data") if isinstance(outcome.data, dict) else None
     if not isinstance(data, dict):
         return {"status": "error", "note": "Detail payload had no data object."}
+    if trial_enabled():
+        got = track_epoch(data.get("trackid"))
+        if (got is None or str(data.get("trackid")) != str(track_id)
+                or not on_trial_day(got, date or "")):
+            return {
+                "status": "error",
+                "error": "Detail start does not match the requested "
+                         "America/Bogota date. The payload was not returned.",
+            }
 
     result: dict[str, Any] = {"status": "ok", "track_id": track_id}
     result.update(decode.decode_detail(data, sections, _user_tz()))
+    if trial_enabled():
+        drop_location_fields(result)
     return result
 
 
@@ -1253,6 +1388,11 @@ def zepp_raw_request(
 ) -> dict[str, Any]:
     """Args: path such as /v1/data/band_data.json, plus query params. The
     user id and auth header are supplied automatically."""
+    if trial_enabled():
+        return {
+            "status": "error",
+            "error": "zepp_raw_request is not available in trial mode.",
+        }
     if not path.startswith("/"):
         return {"status": "error", "error": "path must start with '/'"}
     try:
@@ -1277,8 +1417,22 @@ def zepp_auth_status() -> dict[str, Any]:
     }
 
 
+def apply_trial_surface() -> None:
+    """Drop every tool the restricted trial does not enforce."""
+    if not trial_enabled():
+        return
+    for tool in list(server._tool_manager.list_tools()):
+        if tool.name not in TRIAL_TOOLS:
+            server._tool_manager.remove_tool(tool.name)
+
+
 def main() -> None:
+    _quiet_http_logs()
+    apply_trial_surface()
     server.run("stdio")
+
+
+apply_trial_surface()
 
 
 if __name__ == "__main__":

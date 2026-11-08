@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import stat
 import time
 import urllib.parse
 import uuid
@@ -38,6 +39,15 @@ from typing import Any
 import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+
+from .safety import (
+    LoginStopped,
+    block_further_logins,
+    claim_login_attempt,
+    host_allowed,
+    normalize_host,
+    write_private_text,
+)
 
 _AES_KEY = b"xeNtBVqzDc6tuNTh"
 _AES_IV = b"MAAAYAAAAAAAAABg"
@@ -130,7 +140,28 @@ def _region_host(payload: dict[str, Any]) -> str:
 
 def login(client: httpx.Client, email: str, password: str,
           country: str = "US") -> Credential:
-    """Two-step password login. Exactly one attempt at each step."""
+    """Two-step password login. Exactly one attempt at each step.
+
+    A failed attempt, or a third attempt in this process, raises without
+    sending another password. The cap is two: the first login and one
+    refresh after a 401.
+    """
+    try:
+        claim_login_attempt()
+    except LoginStopped:
+        raise LoginError(
+            "Login stopped for this process. Restart only after checking "
+            "the credentials; automatic retries are not performed."
+        ) from None
+    try:
+        return _login_once(client, email, password, country)
+    except LoginError:
+        block_further_logins()
+        raise
+
+
+def _login_once(client: httpx.Client, email: str, password: str,
+                country: str) -> Credential:
     response = client.post(
         f"https://{_AUTH_HOST}/v2/registrations/tokens",
         content=_build_payload(email, password, country),
@@ -141,12 +172,8 @@ def login(client: httpx.Client, email: str, password: str,
     access_code = (query.get("access") or [None])[0]
 
     if not access_code:
-        error = (query.get("error") or ["no access code returned"])[0]
-        attempts = (query.get("attempts") or [None])[0]
-        maximum = (query.get("max_attempts") or [None])[0]
-        detail = f" (failed attempt {attempts} of {maximum})" if attempts else ""
         raise LoginError(
-            f"Zepp login rejected the credentials: {error}{detail}. "
+            "Zepp login rejected the credentials. "
             "Check ZEPP_EMAIL and ZEPP_PASSWORD. This is not retried "
             "automatically -- repeated failures lock the account."
         )
@@ -169,27 +196,31 @@ def login(client: httpx.Client, email: str, password: str,
         payload = response.json()
     except ValueError:
         raise LoginError(
-            f"Token exchange returned HTTP {response.status_code} with a "
-            "non-JSON body."
+            "Token exchange did not return a usable credential."
         ) from None
 
     token_info = payload.get("token_info") or {}
     app_token = token_info.get("app_token")
     if not app_token:
         raise LoginError(
-            f"Token exchange returned HTTP {response.status_code} but no "
-            f"app_token (result={payload.get('result')!r})."
+            "Token exchange did not return a usable credential."
         )
 
     # app_ttl is the app_token's lifetime in seconds; observed at 2592000 (30
     # days). `ttl` is the longer-lived login_token and is not what we hold.
     ttl = int(token_info.get("app_ttl") or 0) or 2592000
     regist = payload.get("regist_info") or {}
+    region_host = normalize_host(_region_host(payload))
+    if not host_allowed(region_host):
+        raise LoginError(
+            "Zepp login returned a region host that is not an allowed Zepp "
+            "DNS name. The token was not stored and will not be sent."
+        )
 
     return Credential(
         app_token=app_token,
         user_id=str(token_info.get("user_id", "")),
-        region_host=_region_host(payload),
+        region_host=region_host,
         country_code=regist.get("country_code") or country,
         expires_at=time.time() + ttl,
     )
@@ -214,17 +245,17 @@ def device_id() -> str:
     if not cache_enabled():
         return str(uuid.uuid4())
     path = device_id_path()
+    if path.is_symlink():
+        return str(uuid.uuid4())
     if path.is_file():
         cached = path.read_text().strip()
         if cached:
             return cached
     new_id = str(uuid.uuid4())
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(new_id)
-        path.chmod(0o600)
+        write_private_text(path, new_id)
     except OSError:
-        pass  # Falls back to a fresh id next call; not a secret, not fatal.
+        pass  # Not a secret. A later login still gets an in-memory id.
     return new_id
 
 
@@ -243,29 +274,50 @@ def cache_enabled() -> bool:
     return os.environ.get("ZEPP_TOKEN_CACHE", "").lower() not in ("0", "off", "none")
 
 
+def _discard(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def load_cached() -> Credential | None:
     if not cache_enabled():
         return None
     path = cache_path()
+    if path.is_symlink():
+        _discard(path)
+        return None
     if not path.is_file():
         return None
     try:
+        if stat.S_IMODE(path.lstat().st_mode) & 0o077:
+            _discard(path)
+            return None
         credential = Credential.from_json(json.loads(path.read_text()))
     except (ValueError, KeyError, OSError):
         return None
-    return None if credential.expired else credential
+    if credential.expired:
+        return None
+    host = normalize_host(credential.region_host)
+    if not host_allowed(host):
+        _discard(path)
+        return None
+    credential.region_host = host
+    return credential
 
 
 def save_cached(credential: Credential) -> None:
+    """Persist the token or raise. Never leaves a symlink or a loose file."""
     if not cache_enabled():
         return
-    path = cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(credential.to_json(), indent=2))
-        path.chmod(0o600)
-    except OSError:
-        pass  # A cache miss is recoverable; a crashed server is not.
+    host = normalize_host(credential.region_host)
+    if not host_allowed(host):
+        raise OSError("refusing to cache a token for a non-Zepp host")
+    payload = credential.to_json()
+    payload["region_host"] = host
+    write_private_text(cache_path(), json.dumps(payload, indent=2))
 
 
 def clear_cached() -> None:
