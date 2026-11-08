@@ -222,6 +222,65 @@ def test_trial_sleep_is_one_explicit_unenriched_night(monkeypatch):
     assert out["status"] == "ok" and "called" not in enriched
 
 
+def _bogota_epoch(hour: int, minute: int, second: int = 0, day: int = 7) -> int:
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    moment = dt.datetime(2026, 11, day, hour, minute, second,
+                         tzinfo=ZoneInfo("America/Bogota"))
+    return int(moment.timestamp())
+
+
+def _synth(epoch: int, sport: str, code: int = 1) -> dict:
+    return {
+        "track_id": str(epoch), "sport": sport, "sport_code": code,
+        "sport_family": "other", "sport_name_confidence": "user",
+        "start_local": "ignored-other-zone",
+    }
+
+
+def test_trial_list_keeps_only_the_bogota_day(monkeypatch):
+    """Upstream can ignore from/to and return other weeks. The page must not."""
+    monkeypatch.setenv("ZEPP_MODE", "trial")
+    monkeypatch.setattr(server, "_get_client", lambda: object())
+    on_day = [_synth(_bogota_epoch(h, 0), "synth_day") for h in range(12)]
+    previous = _synth(_bogota_epoch(23, 59, 59, day=6), "synth_yesterday")
+    midnight = _synth(_bogota_epoch(0, 0, 0, day=8), "synth_tomorrow")
+    # 2026-11-08 04:59:59 UTC is still 2026-11-07 23:59:59 in Bogota.
+    import datetime as dt
+    utc_late = int(dt.datetime(2026, 11, 8, 4, 59, 59, tzinfo=dt.UTC).timestamp())
+    invalid = {"track_id": "not-a-time", "sport": "synth_invalid", "sport_code": 1,
+               "sport_family": "other", "sport_name_confidence": "user"}
+    rows = on_day + [previous, midnight, _synth(utc_late, "synth_utc_label", 2), invalid]
+    monkeypatch.setattr(
+        server, "_workouts",
+        lambda *args, **kwargs: (rows, server.api.Collected(
+            status="ok", items=[{"raw": i} for i in range(78)])),
+    )
+    listed = server.zepp_list_workouts(
+        from_date="2026-11-07", to_date="2026-11-07", limit=20)
+    blob = json.dumps(listed)
+    assert listed["range"] == {"from": "2026-11-07", "to": "2026-11-07"}
+    assert listed["timezone"] == "America/Bogota"
+    assert listed["trial_day"]["start_inclusive"].startswith("2026-11-07T00:00:00")
+    assert listed["total"] == 13  # 12 hourly plus the UTC-labeled instant
+    assert listed["returned"] == 10  # trial page cap
+    assert listed["next_offset"] == 10
+    assert listed["coverage"]["items"] == 13
+    assert listed["coverage"]["omitted_outside_day"] == 2
+    assert listed["coverage"]["omitted_invalid_timestamp"] == 1
+    assert "synth_yesterday" not in blob and "synth_tomorrow" not in blob
+    assert "synth_invalid" not in blob
+    assert {entry["sport"] for entry in listed["sports_seen"]} == {"synth_day", "synth_utc_label"}
+    page2 = server.zepp_list_workouts(
+        from_date="2026-11-07", to_date="2026-11-07", limit=20, offset=10)
+    assert page2["returned"] == 3 and page2["total"] == 13
+    assert "next_offset" not in page2
+    kept_ids = [row["track_id"] for row in listed["workouts"] + page2["workouts"]]
+    assert str(utc_late) in kept_ids and len(kept_ids) == 13
+    assert server.zepp_list_workouts(
+        from_date="2026-11-31", to_date="2026-11-31")["status"] == "error"
+
+
 def test_trial_workouts_are_one_day_without_gps(monkeypatch):
     monkeypatch.setenv("ZEPP_MODE", "trial")
     assert server.zepp_list_workouts()["status"] == "error"
@@ -234,18 +293,31 @@ def test_trial_workouts_are_one_day_without_gps(monkeypatch):
     )
     listed = server.zepp_list_workouts(from_date="2026-08-01", to_date="2026-08-01")
     assert listed["range"] == {"from": "2026-08-01", "to": "2026-08-01"}
+    assert listed["status"] == "no_data"
+
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    epoch = int(dt.datetime(2026, 8, 1, 15, 0, tzinfo=ZoneInfo("America/Bogota")).timestamp())
+    calls: list[str] = []
 
     def detail(client, track_id, source):
         from zepp_mcp.client import Outcome
+        calls.append(track_id)
         return Outcome("ok", 200, data={"data": {
+            "trackid": int(track_id),
             "longitude_latitude": "secret-track", "lap": "0,1,2",
         }})
 
     monkeypatch.setattr(server.api, "workout_detail", detail)
-    refused = server.zepp_workout_detail("1", "src", include=["gps", "summary"])
-    assert refused["status"] == "error"
-    opened = server.zepp_workout_detail("1", "src")
+    refused = server.zepp_workout_detail(
+        str(epoch), "src", include=["gps", "summary"], date="2026-08-01")
+    assert refused["status"] == "error" and calls == []
+    off_day = server.zepp_workout_detail(str(epoch + 86400), "src", date="2026-08-01")
+    assert off_day["status"] == "error" and calls == []
+    assert server.zepp_workout_detail("not-an-id", "src", date="2026-08-01")["status"] == "error"
+    opened = server.zepp_workout_detail(str(epoch), "src", date="2026-08-01")
     blob = json.dumps(opened)
+    assert calls == [str(epoch)]
     assert "secret-track" not in blob and "gps" not in opened
     assert "longitude_latitude" not in opened.get("available_fields", [])
 

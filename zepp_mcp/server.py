@@ -18,7 +18,16 @@ from . import analysis, body, decode, events, metrics, sports, workouts
 from . import client as api
 from .auth import describe_expiry
 from .codes import format_pace
-from .safety import TRIAL_TOOLS, drop_location_fields, trial_enabled
+from .safety import (
+    TRIAL_TIMEZONE,
+    TRIAL_TOOLS,
+    drop_location_fields,
+    on_trial_day,
+    select_trial_day,
+    track_epoch,
+    trial_enabled,
+    trial_timezone,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 api.load_dotenv(_ROOT / ".env")
@@ -489,6 +498,12 @@ def zepp_list_workouts(
     if collected.status == "error":
         return _collected_status(collected)
 
+    omitted_outside = omitted_invalid = 0
+    if trial_enabled():
+        # The history route is asked for this day, then ignored: a wide
+        # payload must not become total, sports_seen, or the page.
+        items, omitted_outside, omitted_invalid = select_trial_day(items, start)
+
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
     page = items[offset:offset + limit]
@@ -497,9 +512,31 @@ def zepp_list_workouts(
         "range": {"from": start, "to": end},
         "total": len(items), "offset": offset, "returned": len(page),
         "workouts": page,
-        "sports_present": sorted({i["sport"] for i in items}),
+        "sports_present": sorted({i.get("sport") for i in items if i.get("sport")}),
         "sports_seen": _sports_seen(items),
     }
+    if trial_enabled():
+        local_start = dt.datetime.combine(
+            dt.date.fromisoformat(start), dt.time.min, trial_timezone())
+        result["timezone"] = TRIAL_TIMEZONE
+        result["trial_day"] = {
+            "timezone": TRIAL_TIMEZONE,
+            "date": start,
+            "start_inclusive": local_start.isoformat(timespec="seconds"),
+            "end_exclusive": (local_start + dt.timedelta(days=1)).isoformat(
+                timespec="seconds"),
+        }
+        coverage = result.setdefault("coverage", {})
+        coverage["items"] = len(items)
+        coverage["omitted_outside_day"] = omitted_outside
+        coverage["omitted_invalid_timestamp"] = omitted_invalid
+        if not items:
+            result["status"] = "no_data"
+            result["note"] = (
+                "No workout starts on this America/Bogota date. Rows from "
+                "other days, and rows without a usable start timestamp, "
+                "are omitted from total, workouts and sports_seen."
+            )
     if offset + limit < len(items):
         result["next_offset"] = offset + limit
     if collected.status == "ok" and not items and sport:
@@ -518,18 +555,35 @@ def zepp_workout_detail(
     track_id: str,
     source: str,
     include: list[Literal["summary", "laps", "splits", "streams", "gps"]] | None = None,
+    date: str | None = None,
 ) -> dict[str, Any]:
     """Args: track_id and source, both from a zepp_list_workouts result.
     `include` selects which sections to decode; default is summary, laps and
-    splits, because the stream and GPS sections can be very large."""
+    splits, because the stream and GPS sections can be very large. Trial mode
+    also requires `date`, and refuses a track id outside that Bogota day
+    before calling the API."""
     try:
         if trial_enabled():
             if include and ({"gps", "streams"} & set(include)):
                 raise _BadInput(
                     "Trial mode does not return GPS or raw streams."
                 )
+            if not date:
+                raise _BadInput(
+                    "Trial mode requires date=YYYY-MM-DD, the same "
+                    "America/Bogota day passed to zepp_list_workouts."
+                )
+            day, _same = _range(date, date)
+            epoch = track_epoch(track_id)
+            if epoch is None or not on_trial_day(epoch, day):
+                raise _BadInput(
+                    "Trial mode does not open a workout whose start is "
+                    "outside that America/Bogota date."
+                )
             include = ["summary", "laps", "splits"]
         outcome = api.workout_detail(_get_client(), track_id, source)
+    except _BadInput as exc:
+        return {"status": "error", "error": str(exc)}
     except Exception as exc:
         return _fail(exc)
 
@@ -540,6 +594,15 @@ def zepp_workout_detail(
     data = outcome.data.get("data") if isinstance(outcome.data, dict) else None
     if not isinstance(data, dict):
         return {"status": "error", "note": "Detail payload had no data object."}
+    if trial_enabled():
+        got = track_epoch(data.get("trackid"))
+        if (got is None or str(data.get("trackid")) != str(track_id)
+                or not on_trial_day(got, date or "")):
+            return {
+                "status": "error",
+                "error": "Detail start does not match the requested "
+                         "America/Bogota date. The payload was not returned.",
+            }
 
     result: dict[str, Any] = {"status": "ok", "track_id": track_id}
     result.update(decode.decode_detail(data, sections, _user_tz()))

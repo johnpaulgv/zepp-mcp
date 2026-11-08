@@ -7,9 +7,11 @@ names under zepp.com.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import stat
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # One successful login plus one 401 refresh. A failure stops the process
 # before it can walk Zepp's shared 10-attempt lockout.
@@ -28,6 +30,60 @@ TRIAL_TOOLS = frozenset({
 _GPS_FIELDS = frozenset({
     "longitude_latitude", "altitude", "accuracy", "DEMAltitude",
 })
+
+# Trial days are America/Bogota calendar dates. Colombia has no DST.
+TRIAL_TIMEZONE = "America/Bogota"
+_EPOCH_MIN = 946684800    # 2000-01-01 UTC
+_EPOCH_MAX = 4102444800   # 2100-01-01 UTC
+
+
+def trial_timezone() -> dt.tzinfo:
+    return ZoneInfo(TRIAL_TIMEZONE)
+
+
+def track_epoch(value: object) -> int | None:
+    """Start epoch from a history track id. None means do not emit the row."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds < _EPOCH_MIN or seconds >= _EPOCH_MAX:
+        return None
+    return seconds
+
+
+def on_trial_day(epoch: int, day: str) -> bool:
+    """True when `epoch` falls on `day` from local midnight inclusive."""
+    try:
+        local = dt.datetime.fromtimestamp(epoch, trial_timezone())
+    except (OverflowError, OSError, ValueError):
+        return False
+    return local.date().isoformat() == day
+
+
+def select_trial_day(
+    items: list[dict], day: str,
+) -> tuple[list[dict], int, int]:
+    """Keep workouts whose start is on `day`. Drop the rest.
+
+    Returns (kept, omitted_outside_day, omitted_invalid_timestamp). Invalid
+    starts are not treated as in-range.
+    """
+    kept: list[dict] = []
+    outside = 0
+    invalid = 0
+    for item in items:
+        epoch = track_epoch(item.get("track_id"))
+        if epoch is None:
+            invalid += 1
+            continue
+        if on_trial_day(epoch, day):
+            kept.append(item)
+        else:
+            outside += 1
+    return kept, outside, invalid
 
 
 class LoginStopped(RuntimeError):

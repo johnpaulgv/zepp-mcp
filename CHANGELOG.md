@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The HTTP client keeps TLS verification, does not follow redirects, and
   does not honor `HTTPS_PROXY` or `SSL_CERT_FILE`. `certifi` is pinned at or
   above 2026.10.18.
+- Trial workout list and detail keep only sessions whose start falls on the
+  requested `America/Bogota` calendar day. Upstream rows from other days are
+  omitted from `total`, the page, and `sports_seen`. A track id outside that
+  day is not fetched.
 
 ### Added
 

@@ -72,7 +72,7 @@ allowlist is not required.
 | --- | --- |
 | `zepp_auth_status`, `zepp_profile`, `zepp_sleep`, `zepp_list_workouts`, `zepp_workout_detail` | Every other tool, including `zepp_raw_request` |
 | `zepp_sleep(date=YYYY-MM-DD)` with no extra readiness, respiration or SpO₂ fetch | A sleep range, or sleep with no explicit date |
-| Workouts for one explicit `from_date` = `to_date` | The 90-day default, GPS, and raw streams |
+| Workouts whose start falls on that `America/Bogota` date, then `limit`/`offset` | Other days returned by the history route, undated rows, GPS, and raw streams |
 | Profile and device model / firmware | BLE pairing keys, MAC addresses, serial numbers, nicknames |
 | Token file mode `0600` in a `0700` directory, or no file | Symlinks, group/world-readable files, non-`zepp.com` hosts |
 | At most one login plus one refresh after HTTP 401 | Further password attempts in that process |
@@ -353,8 +353,11 @@ does not mean a fresh login against Zepp's shared 10-attempt lockout.
 ## Tools
 
 In the default trial only five tools are registered, `zepp_sleep` does not
-join HRV or SpO₂, and workout history requires one explicit day. The table
-is the full-mode list.
+join HRV or SpO₂, and workout history requires one explicit day. Rows are
+kept only when their start falls on that `America/Bogota` date, even if the
+history payload ignored `from_date`/`to_date`. `zepp_workout_detail` requires
+the same `date` and does not fetch a track id outside it. The table is the
+full-mode list.
 
 | Tool | Returns |
 | --- | --- |
