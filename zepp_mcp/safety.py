@@ -63,6 +63,36 @@ def on_trial_day(epoch: int, day: str) -> bool:
     return local.date().isoformat() == day
 
 
+def service_error_note(http_status: int, error_kind: str | None) -> str:
+    """Fixed text for a failed call. No upstream body, id, or exception text."""
+    if error_kind == "network":
+        return "The request could not reach the service."
+    if http_status == 401 or error_kind == "unauthorized":
+        return "The service refused the credentials."
+    if http_status == 400 or error_kind == "bad_request":
+        return "The service rejected the request."
+    if http_status == 403 or error_kind == "forbidden":
+        return "The service refused access."
+    if http_status == 404 or error_kind == "not_found":
+        return "The service has no such route."
+    if http_status == 429 or error_kind == "rate_limited":
+        return "The service is rate limiting this client."
+    if http_status >= 500 or error_kind == "server_error":
+        return "The service failed to answer."
+    return "The service returned an error."
+
+
+def sleep_instants(row: dict) -> tuple[int | None, int | None]:
+    """Onset and wake epochs from a band row, in seconds. Unknown stays None."""
+    from .decode import decode_band_summary
+
+    summary = decode_band_summary(row.get("summary") or "")
+    sleep = summary.get("slp") if isinstance(summary, dict) else None
+    if not isinstance(sleep, dict):
+        return None, None
+    return track_epoch(sleep.get("st")), track_epoch(sleep.get("ed"))
+
+
 def select_trial_day(
     items: list[dict], day: str,
 ) -> tuple[list[dict], int, int]:

@@ -185,7 +185,7 @@ def test_error_body_cannot_echo_the_token():
     client._credential = _cred()
     note = client.get("/v1/x").note or ""
     assert TOKEN not in note and "fictional-password" not in note
-    assert "[redacted]" in note
+    assert note == "The service rejected the request."
     client.close()
 
 
@@ -219,7 +219,8 @@ def test_trial_sleep_is_one_explicit_unenriched_night(monkeypatch):
         lambda *args, **kwargs: enriched.setdefault("called", True),
     )
     out = server.zepp_sleep(date="2026-08-01")
-    assert out["status"] == "ok" and "called" not in enriched
+    # The stub row has no wake instant, so it is not assigned to the morning.
+    assert out["status"] == "no_data" and "called" not in enriched
 
 
 def _bogota_epoch(hour: int, minute: int, second: int = 0, day: int = 7) -> int:

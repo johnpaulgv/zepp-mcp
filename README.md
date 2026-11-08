@@ -71,7 +71,7 @@ allowlist is not required.
 | What the process does | What it refuses |
 | --- | --- |
 | `zepp_auth_status`, `zepp_profile`, `zepp_sleep`, `zepp_list_workouts`, `zepp_workout_detail` | Every other tool, including `zepp_raw_request` |
-| `zepp_sleep(date=YYYY-MM-DD)` with no extra readiness, respiration or SpO₂ fetch | A sleep range, or sleep with no explicit date |
+| `zepp_sleep(date=YYYY-MM-DD)`: the night whose wake falls on that Bogotá morning. Several matches: latest wake, then earliest onset, then upstream order. No readiness, respiration or SpO₂ fetch | A sleep range, a night that ends on another morning, or sleep with no explicit date |
 | Workouts whose start falls on that `America/Bogota` date, then `limit`/`offset` | Other days returned by the history route, undated rows, GPS, and raw streams |
 | Profile and device model / firmware | BLE pairing keys, MAC addresses, serial numbers, nicknames |
 | Token file mode `0600` in a `0700` directory, or no file | Symlinks, group/world-readable files, non-`zepp.com` hosts |

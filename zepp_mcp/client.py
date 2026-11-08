@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 
 from .auth import Credential, LoginError, clear_cached, load_cached, login, save_cached
-from .safety import host_allowed, normalize_host, redact
+from .safety import host_allowed, normalize_host, service_error_note
 
 
 @dataclass
@@ -44,9 +44,18 @@ class Outcome:
                                "http_status": self.http_status}
         if self.error_kind:
             out["error_kind"] = self.error_kind
-        if self.note:
+        if self.status == "error":
+            allowed = {
+                service_error_note(self.http_status, self.error_kind),
+                service_error_note(0, "network"),
+                "The service response was not JSON.",
+                "Refusing request: host or path is not allowed.",
+            }
+            out["note"] = (self.note if self.note in allowed
+                           else service_error_note(self.http_status, self.error_kind))
+        elif self.note:
             out["note"] = self.note
-        if self.data is not None:
+        if self.data is not None and self.status != "error":
             out["data"] = self.data
         return out
 
@@ -252,14 +261,22 @@ class ZeppClient:
         if cached is not None:
             return cached
 
-        credential = self.credential()
+        try:
+            credential = self.credential()
+        except LoginError:
+            return Outcome(
+                "error", 401, error_kind="unauthorized",
+                note=service_error_note(401, "unauthorized"),
+            )
         outcome = self._request(credential, path, params)
         if outcome.http_status == 401:
             try:
                 credential = self._reauthenticate()
-            except LoginError as exc:
-                return Outcome("error", 401, note=str(exc),
-                               error_kind="unauthorized")
+            except LoginError:
+                return Outcome(
+                    "error", 401, error_kind="unauthorized",
+                    note=service_error_note(401, "unauthorized"),
+                )
             outcome = self._request(credential, path, params)
 
         # Errors are never cached: a transient 500 must not stick.
@@ -308,9 +325,6 @@ class ZeppClient:
         if slot > now:
             time.sleep(slot - now)
 
-    def _note(self, credential: Credential, text: str) -> str:
-        return redact(text, credential.app_token, self._email, self._password)
-
     def _request(self, credential: Credential, path: str,
                  params: dict[str, Any] | None) -> Outcome:
         host = normalize_host(credential.region_host)
@@ -328,34 +342,26 @@ class ZeppClient:
                 url, headers={"apptoken": credential.app_token},
                 params=params or {},
             )
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             return Outcome(
                 "error", 0, error_kind="network",
-                note=self._note(credential, f"network error: {exc}"),
+                note=service_error_note(0, "network"),
             )
 
-        # The user id appears in some paths; it is not echoed back to the
-        # model, which may restate it in a transcript.
-        uid = credential.user_id
-        shown = path.replace(uid, "{uid}") if uid else path
         if response.status_code >= 400:
-            kind, meaning = _classify(response.status_code)
-            # Truncated body only, with the token, password and user id removed.
-            body = response.text[:200].replace(uid or chr(0), "{uid}")
+            kind, _meaning = _classify(response.status_code)
             return Outcome(
                 "error", response.status_code, error_kind=kind,
-                note=self._note(
-                    credential,
-                    f"Zepp returned HTTP {response.status_code} for {shown}. "
-                    f"{meaning} Body starts: {body!r}",
-                ),
+                note=service_error_note(response.status_code, kind),
             )
 
         try:
             payload = response.json()
         except ValueError:
-            return Outcome("error", response.status_code,
-                           note="response was not JSON")
+            return Outcome(
+                "error", response.status_code, error_kind="bad_response",
+                note="The service response was not JSON.",
+            )
 
         if _is_empty(payload):
             return Outcome(

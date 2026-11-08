@@ -148,8 +148,11 @@ def login(client: httpx.Client, email: str, password: str,
     """
     try:
         claim_login_attempt()
-    except LoginStopped as exc:
-        raise LoginError(str(exc)) from None
+    except LoginStopped:
+        raise LoginError(
+            "Login stopped for this process. Restart only after checking "
+            "the credentials; automatic retries are not performed."
+        ) from None
     try:
         return _login_once(client, email, password, country)
     except LoginError:
@@ -169,12 +172,8 @@ def _login_once(client: httpx.Client, email: str, password: str,
     access_code = (query.get("access") or [None])[0]
 
     if not access_code:
-        error = (query.get("error") or ["no access code returned"])[0]
-        attempts = (query.get("attempts") or [None])[0]
-        maximum = (query.get("max_attempts") or [None])[0]
-        detail = f" (failed attempt {attempts} of {maximum})" if attempts else ""
         raise LoginError(
-            f"Zepp login rejected the credentials: {error}{detail}. "
+            "Zepp login rejected the credentials. "
             "Check ZEPP_EMAIL and ZEPP_PASSWORD. This is not retried "
             "automatically -- repeated failures lock the account."
         )
@@ -197,16 +196,14 @@ def _login_once(client: httpx.Client, email: str, password: str,
         payload = response.json()
     except ValueError:
         raise LoginError(
-            f"Token exchange returned HTTP {response.status_code} with a "
-            "non-JSON body."
+            "Token exchange did not return a usable credential."
         ) from None
 
     token_info = payload.get("token_info") or {}
     app_token = token_info.get("app_token")
     if not app_token:
         raise LoginError(
-            f"Token exchange returned HTTP {response.status_code} but no "
-            f"app_token (result={payload.get('result')!r})."
+            "Token exchange did not return a usable credential."
         )
 
     # app_ttl is the app_token's lifetime in seconds; observed at 2592000 (30

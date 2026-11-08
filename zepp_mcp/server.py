@@ -16,7 +16,7 @@ from mcp.server import MCPServer
 
 from . import analysis, body, decode, events, metrics, sports, workouts
 from . import client as api
-from .auth import describe_expiry
+from .auth import LoginError, describe_expiry
 from .codes import format_pace
 from .safety import (
     TRIAL_TIMEZONE,
@@ -24,6 +24,8 @@ from .safety import (
     drop_location_fields,
     on_trial_day,
     select_trial_day,
+    service_error_note,
+    sleep_instants,
     track_epoch,
     trial_enabled,
     trial_timezone,
@@ -79,7 +81,18 @@ def _get_client() -> api.ZeppClient:
 
 
 def _fail(exc: Exception) -> dict[str, Any]:
-    return {"status": "error", "error": str(exc)}
+    """A failed call. Upstream exception text is never copied out."""
+    if isinstance(exc, _BadInput):
+        return {"status": "error", "error_code": "bad_input", "error": str(exc)}
+    if isinstance(exc, LoginError):
+        return {
+            "status": "error", "error_code": "login_failed",
+            "error": service_error_note(401, "unauthorized"),
+        }
+    return {
+        "status": "error", "error_code": "request_failed",
+        "error": "The request could not be completed.",
+    }
 
 
 class _BadInput(ValueError):
@@ -284,6 +297,27 @@ def zepp_heart_rate(
     return result
 
 
+def _select_trial_night(rows: list[dict[str, Any]], day: str) -> dict[str, Any] | None:
+    """The night whose wake falls on `day` in America/Bogota.
+
+    Several matches: latest wake, then earliest onset, then upstream order.
+    A row with no usable wake instant is not assigned to the morning.
+    """
+    ranked: list[tuple[int, int, int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        night = _night(row)
+        if night is None or night.get("status") != "ok":
+            continue
+        onset, wake = sleep_instants(row)
+        if wake is None or not on_trial_day(wake, day):
+            continue
+        ranked.append((-(wake), onset if onset is not None else 2**62, index, night))
+    if not ranked:
+        return None
+    ranked.sort()
+    return ranked[0][3]
+
+
 def _night(row: dict[str, Any]) -> dict[str, Any] | None:
     summary = decode.summarise_day(row)
     sleep = summary.get("sleep")
@@ -392,6 +426,15 @@ def zepp_sleep(
 
     single = not (from_date or to_date)
     if single:
+        if trial_enabled():
+            chosen = _select_trial_night(collected.items, start)
+            if chosen is None:
+                return {
+                    "status": "no_data", "date": start,
+                    "note": "No recorded sleep ends on this America/Bogota "
+                            "morning. A missing night is not zero hours.",
+                }
+            return chosen
         if not nights:
             return {"status": "no_data", "date": start,
                     "note": "No sleep block in this date's record."}

@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested `America/Bogota` calendar day. Upstream rows from other days are
   omitted from `total`, the page, and `sports_seen`. A track id outside that
   day is not fetched.
+- Trial `zepp_sleep(date=)` returns the night whose wake falls on that
+  Bogotá morning. Several matches use the latest wake, then the earliest
+  onset, then upstream order. A missing night stays `no_data`.
+- Service errors no longer copy the upstream body, exception text, or ids
+  into the tool result.
 
 ### Added
 
